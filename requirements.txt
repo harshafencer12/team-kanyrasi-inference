@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+pystac-client
+planetary-computer
+rioxarray
+rasterio
+scikit-learn
+joblib
+numpy
