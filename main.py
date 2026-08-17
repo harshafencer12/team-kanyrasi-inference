@@ -16,7 +16,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-MODEL_PATH = "model_india_compressed.pkl"
+MODEL_PATH = "model_india_small.pkl"
 CATALOG_URL = "https://planetarycomputer.microsoft.com/api/stac/v1"
 DATE_RANGE = "2025-08-01/2026-02-28"
 MAX_CLOUD = 25
