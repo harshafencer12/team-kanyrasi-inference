@@ -14,7 +14,6 @@ Output:
 """
 
 import io
-import os
 import base64
 
 import joblib
@@ -37,10 +36,10 @@ MODEL_PATH = "model_india_small.pkl"
 
 CATALOG_URL = "https://planetarycomputer.microsoft.com/api/stac/v1"
 
-# Search a wider period so the API continues working
-# when recent scenes aren't available.
-DATE_RANGE = "2025-08-01/2026-12-31"
+# Search period
+DATE_RANGE = "2025-08-01/2026-08-18"
 
+# Maximum acceptable cloud cover
 MAX_CLOUD = 30
 
 # Approximately 3 km around requested point
@@ -101,7 +100,7 @@ WORLDCOVER_CLASSES = {
 
 app = FastAPI(
     title="Team Kanyarasi Satellite Intelligence API",
-    version="1.0.0",
+    version="1.1.0",
 )
 
 
@@ -170,50 +169,61 @@ def health():
 
 
 # ============================================================
-# RGB IMAGE CREATION
+# RGB IMAGE PROCESSING
 # ============================================================
+
+def enhance_channel(channel):
+    """
+    Improve visual contrast using robust percentile stretching.
+    """
+
+    channel = channel.astype("float32")
+
+    valid = channel[np.isfinite(channel)]
+
+    if valid.size == 0:
+        return np.zeros_like(channel, dtype=np.float32)
+
+    low = np.percentile(valid, 2)
+    high = np.percentile(valid, 98)
+
+    if high <= low:
+        return np.zeros_like(channel, dtype=np.float32)
+
+    channel = (channel - low) / (
+        high - low + 1e-6
+    )
+
+    channel = np.clip(
+        channel,
+        0,
+        1,
+    )
+
+    return channel
+
 
 def create_rgb_image(red, green, blue):
     """
-    Convert Sentinel-2 RGB arrays into a compressed JPEG
-    returned as a base64 data URL.
+    Create enhanced true-color Sentinel-2 imagery.
+
+    Sentinel-2:
+        B04 = Red
+        B03 = Green
+        B02 = Blue
     """
 
-    # Convert to float
-    red = red.astype("float32")
-    green = green.astype("float32")
-    blue = blue.astype("float32")
+    red = enhance_channel(red)
+    green = enhance_channel(green)
+    blue = enhance_channel(blue)
 
-    # Remove invalid values
-    red = np.nan_to_num(red)
-    green = np.nan_to_num(green)
-    blue = np.nan_to_num(blue)
-
-    # Sentinel-2 reflectance values are commonly around 0-10000.
-    # Normalize using percentile stretching for a better-looking image.
-    def stretch(channel):
-        low = np.percentile(channel, 2)
-        high = np.percentile(channel, 98)
-
-        if high <= low:
-            return np.zeros_like(channel)
-
-        channel = (channel - low) / (high - low)
-
-        return np.clip(channel, 0, 1)
-
-    red = stretch(red)
-    green = stretch(green)
-    blue = stretch(blue)
-
-    # Slight gamma correction
-    gamma = 0.8
+    # Gamma correction
+    gamma = 0.85
 
     red = np.power(red, gamma)
     green = np.power(green, gamma)
     blue = np.power(blue, gamma)
 
-    # RGB image
     rgb = np.stack(
         [
             red,
@@ -223,19 +233,42 @@ def create_rgb_image(red, green, blue):
         axis=-1,
     )
 
-    rgb = (rgb * 255).astype("uint8")
+    rgb = np.clip(
+        rgb * 255,
+        0,
+        255,
+    ).astype("uint8")
 
-    image = Image.fromarray(rgb, mode="RGB")
+    image = Image.fromarray(
+        rgb,
+        mode="RGB",
+    )
 
-    # Resize if extremely large
-    max_dimension = 1200
+    # Keep response size reasonable
+    max_dimension = 1600
 
     if max(image.size) > max_dimension:
-        scale = max_dimension / max(image.size)
+
+        scale = (
+            max_dimension
+            / max(image.size)
+        )
 
         new_size = (
-            int(image.size[0] * scale),
-            int(image.size[1] * scale),
+            max(
+                1,
+                int(
+                    image.size[0]
+                    * scale
+                ),
+            ),
+            max(
+                1,
+                int(
+                    image.size[1]
+                    * scale
+                ),
+            ),
         )
 
         image = image.resize(
@@ -243,13 +276,12 @@ def create_rgb_image(red, green, blue):
             Image.Resampling.LANCZOS,
         )
 
-    # Compress to JPEG
     buffer = io.BytesIO()
 
     image.save(
         buffer,
         format="JPEG",
-        quality=88,
+        quality=92,
         optimize=True,
     )
 
@@ -257,7 +289,10 @@ def create_rgb_image(red, green, blue):
         buffer.getvalue()
     ).decode("utf-8")
 
-    return f"data:image/jpeg;base64,{encoded}"
+    return (
+        "data:image/jpeg;base64,"
+        + encoded
+    )
 
 
 # ============================================================
@@ -309,21 +344,23 @@ def analyze(req: AnalyzeRequest):
     print("Searching Sentinel-2 imagery...")
 
     search = catalog.search(
-        collections=["sentinel-2-l2a"],
+        collections=[
+            "sentinel-2-l2a"
+        ],
+
         bbox=bbox,
+
         datetime=DATE_RANGE,
+
         query={
             "eo:cloud_cover": {
-                "lt": MAX_CLOUD,
+                "lt": MAX_CLOUD
             }
         },
-        sortby=[
-            {
-                "field": "properties.eo:cloud_cover",
-                "direction": "asc",
-            }
-        ],
-        max_items=1,
+
+        # Get several candidates so we can select
+        # the newest suitable scene.
+        max_items=10,
     )
 
     items = list(search.items())
@@ -332,22 +369,46 @@ def analyze(req: AnalyzeRequest):
         raise HTTPException(
             status_code=404,
             detail=(
-                "No suitable Sentinel-2 imagery found "
-                "for this location."
+                "No suitable Sentinel-2 imagery "
+                "found for this location."
             ),
         )
 
+
+    # --------------------------------------------------------
+    # Select latest scene
+    # --------------------------------------------------------
+
+    items.sort(
+        key=lambda x: (
+            x.properties.get(
+                "datetime",
+                ""
+            )
+        ),
+        reverse=True,
+    )
+
     item = items[0]
 
-    print("Scene found:")
-    print("Scene:", item.id)
-    print(
-        "Date:",
-        item.properties.get("datetime"),
+    scene_datetime = item.properties.get(
+        "datetime"
     )
+
+    cloud_cover = item.properties.get(
+        "eo:cloud_cover"
+    )
+
+    if cloud_cover is None:
+        cloud_cover = 0
+
+
+    print("Scene selected:")
+    print("Scene:", item.id)
+    print("Date:", scene_datetime)
     print(
         "Cloud:",
-        item.properties.get("eo:cloud_cover"),
+        cloud_cover,
     )
 
 
@@ -366,7 +427,10 @@ def analyze(req: AnalyzeRequest):
             "B08",
         ]:
 
-            print("Loading", band)
+            print(
+                "Loading",
+                band,
+            )
 
             da = rioxarray.open_rasterio(
                 item.assets[band].href
@@ -384,10 +448,29 @@ def analyze(req: AnalyzeRequest):
         # NUMPY ARRAYS
         # ----------------------------------------------------
 
-        blue = bands["B02"].values.astype("float32")
-        green = bands["B03"].values.astype("float32")
-        red = bands["B04"].values.astype("float32")
-        nir = bands["B08"].values.astype("float32")
+        blue = bands[
+            "B02"
+        ].values.astype(
+            "float32"
+        )
+
+        green = bands[
+            "B03"
+        ].values.astype(
+            "float32"
+        )
+
+        red = bands[
+            "B04"
+        ].values.astype(
+            "float32"
+        )
+
+        nir = bands[
+            "B08"
+        ].values.astype(
+            "float32"
+        )
 
 
         # ----------------------------------------------------
@@ -397,12 +480,16 @@ def analyze(req: AnalyzeRequest):
         ndvi = (
             (nir - red)
             /
-            (nir + red + 1e-6)
+            (
+                nir
+                + red
+                + 1e-6
+            )
         )
 
 
         # ----------------------------------------------------
-        # CREATE ML FEATURES
+        # ML FEATURES
         # ----------------------------------------------------
 
         X = np.stack(
@@ -414,17 +501,25 @@ def analyze(req: AnalyzeRequest):
                 ndvi,
             ],
             axis=-1,
-        ).reshape(-1, 5)
+        ).reshape(
+            -1,
+            5,
+        )
 
-
-        valid = ~np.isnan(X).any(axis=1)
+        valid = (
+            ~np.isnan(X).any(
+                axis=1
+            )
+        )
 
 
         # ----------------------------------------------------
         # ML PREDICTION
         # ----------------------------------------------------
 
-        print("Running Random Forest...")
+        print(
+            "Running Random Forest..."
+        )
 
         preds = clf.predict(
             X[valid]
@@ -451,33 +546,52 @@ def analyze(req: AnalyzeRequest):
 
             cls_int = int(cls)
 
-            if cls_int in WORLDCOVER_CLASSES:
+            if (
+                cls_int
+                in WORLDCOVER_CLASSES
+            ):
 
-                info = WORLDCOVER_CLASSES[
-                    cls_int
-                ]
+                info = (
+                    WORLDCOVER_CLASSES[
+                        cls_int
+                    ]
+                )
 
                 land_cover.append(
                     {
-                        "name": info["name"],
-                        "value": round(
-                            float(count)
-                            / total
-                            * 100,
-                            1,
-                        ),
-                        "color": info["color"],
+                        "name":
+                            info[
+                                "name"
+                            ],
+
+                        "value":
+                            round(
+                                float(
+                                    count
+                                )
+                                / total
+                                * 100,
+                                1,
+                            ),
+
+                        "color":
+                            info[
+                                "color"
+                            ],
                     }
                 )
 
+
         land_cover.sort(
-            key=lambda x: x["value"],
+            key=lambda x: x[
+                "value"
+            ],
             reverse=True,
         )
 
 
         # ----------------------------------------------------
-        # VEGETATION
+        # NDVI HEALTH
         # ----------------------------------------------------
 
         avg_ndvi = float(
@@ -486,27 +600,37 @@ def analyze(req: AnalyzeRequest):
 
         if avg_ndvi > 0.5:
 
-            vegetation_health = "healthy"
+            vegetation_health = (
+                "healthy"
+            )
 
         elif avg_ndvi > 0.2:
 
-            vegetation_health = "moderate"
+            vegetation_health = (
+                "moderate"
+            )
 
         else:
 
-            vegetation_health = "sparse/stressed"
+            vegetation_health = (
+                "sparse/stressed"
+            )
 
 
         # ----------------------------------------------------
-        # CREATE TRUE COLOR IMAGE
+        # TRUE-COLOR IMAGE
         # ----------------------------------------------------
 
-        print("Creating satellite preview...")
+        print(
+            "Creating satellite preview..."
+        )
 
-        satellite_image = create_rgb_image(
-            red,
-            green,
-            blue,
+        satellite_image = (
+            create_rgb_image(
+                red,
+                green,
+                blue,
+            )
         )
 
 
@@ -523,29 +647,36 @@ def analyze(req: AnalyzeRequest):
 
             "scene": {
                 "id": item.id,
-                "date": item.properties.get(
-                    "datetime"
-                ),
-                "cloud_cover": item.properties.get(
-                    "eo:cloud_cover"
-                ),
+
+                "date": scene_datetime,
+
+                "cloud_cover":
+                    float(
+                        cloud_cover
+                    ),
             },
 
-            "satellite_image": satellite_image,
+            "satellite_image":
+                satellite_image,
 
-            "land_cover": land_cover,
+            "land_cover":
+                land_cover,
 
-            "avg_ndvi": round(
-                avg_ndvi,
-                3,
-            ),
+            "avg_ndvi":
+                round(
+                    avg_ndvi,
+                    3,
+                ),
 
             "vegetation_health":
                 vegetation_health,
 
         }
 
-        print("Analysis completed successfully.")
+
+        print(
+            "Analysis completed successfully."
+        )
 
         return response
 
@@ -559,5 +690,8 @@ def analyze(req: AnalyzeRequest):
 
         raise HTTPException(
             status_code=500,
-            detail=f"Analysis failed: {str(e)}",
+            detail=(
+                "Analysis failed: "
+                + str(e)
+            ),
         )
