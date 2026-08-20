@@ -1,20 +1,23 @@
 """
-On-demand Sentinel-2 farm analysis API.
+Team Kanyarasi — Sentinel-2 Farm Analysis API
 
-Input:
-    latitude + longitude
+Endpoints:
 
-Output:
-    - latest suitable Sentinel-2 scene
-    - true-color satellite image
-    - cloud cover
-    - NDVI
-    - vegetation health
-    - ML land-cover classification
+GET  /health
+POST /analyze
+GET  /ndvi-history?lat=<lat>&lon=<lon>
+
+The /analyze endpoint returns the latest suitable Sentinel-2
+scene and runs the Random Forest land-cover model.
+
+The /ndvi-history endpoint retrieves real historical Sentinel-2
+observations for the selected coordinate and calculates NDVI
+from the Red (B04) and NIR (B08) bands.
 """
 
-import io
 import base64
+import io
+from datetime import date, timedelta
 
 import joblib
 import numpy as np
@@ -34,15 +37,23 @@ from pydantic import BaseModel
 
 MODEL_PATH = "model_india_small.pkl"
 
-CATALOG_URL = "https://planetarycomputer.microsoft.com/api/stac/v1"
+CATALOG_URL = (
+    "https://planetarycomputer.microsoft.com/api/stac/v1"
+)
 
-# Search period
-DATE_RANGE = "2025-08-01/2026-08-18"
+# Latest analysis search range
+DATE_RANGE = "2025-08-01/2026-08-20"
 
-# Maximum acceptable cloud cover
+# Historical NDVI period
+HISTORY_DAYS = 365
+
+# Number of historical monthly observations returned
+HISTORY_POINTS = 12
+
+# Maximum acceptable scene-level cloud cover
 MAX_CLOUD = 30
 
-# Approximately 3 km around requested point
+# Approx. 3 km x 3 km analysis window
 BUFFER_DEG = 0.03
 
 
@@ -100,7 +111,7 @@ WORLDCOVER_CLASSES = {
 
 app = FastAPI(
     title="Team Kanyarasi Satellite Intelligence API",
-    version="1.1.0",
+    version="1.2.0",
 )
 
 
@@ -157,6 +168,43 @@ class AnalyzeRequest(BaseModel):
 
 
 # ============================================================
+# VALIDATION
+# ============================================================
+
+def validate_coordinates(
+    lat: float,
+    lon: float,
+):
+    if not -90 <= lat <= 90:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid latitude.",
+        )
+
+    if not -180 <= lon <= 180:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid longitude.",
+        )
+
+
+# ============================================================
+# BBOX
+# ============================================================
+
+def make_bbox(
+    lat: float,
+    lon: float,
+):
+    return [
+        lon - BUFFER_DEG,
+        lat - BUFFER_DEG,
+        lon + BUFFER_DEG,
+        lat + BUFFER_DEG,
+    ]
+
+
+# ============================================================
 # HEALTH CHECK
 # ============================================================
 
@@ -165,6 +213,7 @@ def health():
     return {
         "status": "ok",
         "service": "team-kanyarasi-inference",
+        "version": "1.2.0",
     }
 
 
@@ -174,7 +223,7 @@ def health():
 
 def enhance_channel(channel):
     """
-    Improve visual contrast using robust percentile stretching.
+    Improve visual contrast using percentile stretching.
     """
 
     channel = channel.astype("float32")
@@ -182,47 +231,73 @@ def enhance_channel(channel):
     valid = channel[np.isfinite(channel)]
 
     if valid.size == 0:
-        return np.zeros_like(channel, dtype=np.float32)
+        return np.zeros_like(
+            channel,
+            dtype=np.float32,
+        )
 
-    low = np.percentile(valid, 2)
-    high = np.percentile(valid, 98)
+    low = np.percentile(
+        valid,
+        2,
+    )
+
+    high = np.percentile(
+        valid,
+        98,
+    )
 
     if high <= low:
-        return np.zeros_like(channel, dtype=np.float32)
+        return np.zeros_like(
+            channel,
+            dtype=np.float32,
+        )
 
-    channel = (channel - low) / (
+    channel = (
+        channel - low
+    ) / (
         high - low + 1e-6
     )
 
-    channel = np.clip(
+    return np.clip(
         channel,
         0,
         1,
     )
 
-    return channel
 
-
-def create_rgb_image(red, green, blue):
+def create_rgb_image(
+    red,
+    green,
+    blue,
+):
     """
     Create enhanced true-color Sentinel-2 imagery.
 
-    Sentinel-2:
-        B04 = Red
-        B03 = Green
-        B02 = Blue
+    B04 = Red
+    B03 = Green
+    B02 = Blue
     """
 
     red = enhance_channel(red)
     green = enhance_channel(green)
     blue = enhance_channel(blue)
 
-    # Gamma correction
     gamma = 0.85
 
-    red = np.power(red, gamma)
-    green = np.power(green, gamma)
-    blue = np.power(blue, gamma)
+    red = np.power(
+        red,
+        gamma,
+    )
+
+    green = np.power(
+        green,
+        gamma,
+    )
+
+    blue = np.power(
+        blue,
+        gamma,
+    )
 
     rgb = np.stack(
         [
@@ -244,7 +319,6 @@ def create_rgb_image(red, green, blue):
         mode="RGB",
     )
 
-    # Keep response size reasonable
     max_dimension = 1600
 
     if max(image.size) > max_dimension:
@@ -296,27 +370,131 @@ def create_rgb_image(red, green, blue):
 
 
 # ============================================================
+# LOAD SINGLE BAND
+# ============================================================
+
+def load_band(
+    item,
+    band_name,
+    bbox,
+):
+    """
+    Download and clip one Sentinel-2 band
+    around the selected AOI.
+    """
+
+    if band_name not in item.assets:
+        raise RuntimeError(
+            f"Sentinel-2 scene is missing asset {band_name}"
+        )
+
+    da = rioxarray.open_rasterio(
+        item.assets[band_name].href
+    )
+
+    clipped = da.rio.clip_box(
+        *bbox,
+        crs="EPSG:4326",
+    )
+
+    return clipped.squeeze()
+
+
+# ============================================================
+# CALCULATE NDVI FOR SCENE
+# ============================================================
+
+def calculate_scene_ndvi(
+    item,
+    bbox,
+):
+    """
+    Calculate average NDVI from:
+        B04 = Red
+        B08 = NIR
+
+    NDVI = (NIR - Red) / (NIR + Red)
+    """
+
+    red_da = load_band(
+        item,
+        "B04",
+        bbox,
+    )
+
+    nir_da = load_band(
+        item,
+        "B08",
+        bbox,
+    )
+
+    red = red_da.values.astype(
+        "float32"
+    )
+
+    nir = nir_da.values.astype(
+        "float32"
+    )
+
+    ndvi = (
+        (nir - red)
+        / (
+            nir + red + 1e-6
+        )
+    )
+
+    ndvi = np.where(
+        np.isfinite(ndvi),
+        ndvi,
+        np.nan,
+    )
+
+    valid = ndvi[
+        np.isfinite(ndvi)
+    ]
+
+    if valid.size == 0:
+        raise RuntimeError(
+            "No valid NDVI pixels found."
+        )
+
+    avg_ndvi = float(
+        np.mean(valid)
+    )
+
+    return (
+        ndvi,
+        avg_ndvi,
+    )
+
+
+# ============================================================
+# VEGETATION HEALTH
+# ============================================================
+
+def classify_vegetation_health(
+    avg_ndvi: float,
+):
+    if avg_ndvi > 0.5:
+        return "healthy"
+
+    if avg_ndvi > 0.2:
+        return "moderate"
+
+    return "sparse/stressed"
+
+
+# ============================================================
 # ANALYZE
 # ============================================================
 
 @app.post("/analyze")
 def analyze(req: AnalyzeRequest):
 
-    # --------------------------------------------------------
-    # Validate coordinates
-    # --------------------------------------------------------
-
-    if not -90 <= req.lat <= 90:
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid latitude.",
-        )
-
-    if not -180 <= req.lon <= 180:
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid longitude.",
-        )
+    validate_coordinates(
+        req.lat,
+        req.lon,
+    )
 
     print("\n==========================================")
     print("NEW ANALYSIS REQUEST")
@@ -324,46 +502,32 @@ def analyze(req: AnalyzeRequest):
     print("Longitude:", req.lon)
     print("==========================================")
 
+    bbox = make_bbox(
+        req.lat,
+        req.lon,
+    )
 
-    # --------------------------------------------------------
-    # Bounding box
-    # --------------------------------------------------------
-
-    bbox = [
-        req.lon - BUFFER_DEG,
-        req.lat - BUFFER_DEG,
-        req.lon + BUFFER_DEG,
-        req.lat + BUFFER_DEG,
-    ]
-
-
-    # --------------------------------------------------------
-    # Search Sentinel-2
-    # --------------------------------------------------------
-
-    print("Searching Sentinel-2 imagery...")
+    print(
+        "Searching Sentinel-2 imagery..."
+    )
 
     search = catalog.search(
         collections=[
             "sentinel-2-l2a"
         ],
-
         bbox=bbox,
-
         datetime=DATE_RANGE,
-
         query={
             "eo:cloud_cover": {
-                "lt": MAX_CLOUD
+                "lt": MAX_CLOUD,
             }
         },
-
-        # Get several candidates so we can select
-        # the newest suitable scene.
         max_items=10,
     )
 
-    items = list(search.items())
+    items = list(
+        search.items()
+    )
 
     if not items:
         raise HTTPException(
@@ -374,16 +538,12 @@ def analyze(req: AnalyzeRequest):
             ),
         )
 
-
-    # --------------------------------------------------------
-    # Select latest scene
-    # --------------------------------------------------------
-
+    # Newest scene first
     items.sort(
         key=lambda x: (
             x.properties.get(
                 "datetime",
-                ""
+                "",
             )
         ),
         reverse=True,
@@ -391,32 +551,31 @@ def analyze(req: AnalyzeRequest):
 
     item = items[0]
 
-    scene_datetime = item.properties.get(
-        "datetime"
+    scene_datetime = (
+        item.properties.get(
+            "datetime"
+        )
     )
 
-    cloud_cover = item.properties.get(
-        "eo:cloud_cover"
+    cloud_cover = (
+        item.properties.get(
+            "eo:cloud_cover"
+        )
     )
 
     if cloud_cover is None:
         cloud_cover = 0
 
-
     print("Scene selected:")
     print("Scene:", item.id)
     print("Date:", scene_datetime)
-    print(
-        "Cloud:",
-        cloud_cover,
-    )
-
+    print("Cloud:", cloud_cover)
 
     try:
 
-        # ----------------------------------------------------
-        # LOAD BANDS
-        # ----------------------------------------------------
+        # ------------------------------------------------------
+        # LOAD RGB + NIR
+        # ------------------------------------------------------
 
         bands = {}
 
@@ -432,21 +591,11 @@ def analyze(req: AnalyzeRequest):
                 band,
             )
 
-            da = rioxarray.open_rasterio(
-                item.assets[band].href
+            bands[band] = load_band(
+                item,
+                band,
+                bbox,
             )
-
-            clipped = da.rio.clip_box(
-                *bbox,
-                crs="EPSG:4326",
-            )
-
-            bands[band] = clipped.squeeze()
-
-
-        # ----------------------------------------------------
-        # NUMPY ARRAYS
-        # ----------------------------------------------------
 
         blue = bands[
             "B02"
@@ -472,25 +621,22 @@ def analyze(req: AnalyzeRequest):
             "float32"
         )
 
-
-        # ----------------------------------------------------
+        # ------------------------------------------------------
         # NDVI
-        # ----------------------------------------------------
+        # ------------------------------------------------------
 
         ndvi = (
             (nir - red)
-            /
-            (
+            / (
                 nir
                 + red
                 + 1e-6
             )
         )
 
-
-        # ----------------------------------------------------
+        # ------------------------------------------------------
         # ML FEATURES
-        # ----------------------------------------------------
+        # ------------------------------------------------------
 
         X = np.stack(
             [
@@ -512,10 +658,9 @@ def analyze(req: AnalyzeRequest):
             )
         )
 
-
-        # ----------------------------------------------------
+        # ------------------------------------------------------
         # ML PREDICTION
-        # ----------------------------------------------------
+        # ------------------------------------------------------
 
         print(
             "Running Random Forest..."
@@ -525,10 +670,9 @@ def analyze(req: AnalyzeRequest):
             X[valid]
         )
 
-
-        # ----------------------------------------------------
+        # ------------------------------------------------------
         # LAND COVER
-        # ----------------------------------------------------
+        # ------------------------------------------------------
 
         unique, counts = np.unique(
             preds,
@@ -560,27 +704,24 @@ def analyze(req: AnalyzeRequest):
                 land_cover.append(
                     {
                         "name":
-                            info[
-                                "name"
-                            ],
+                            info["name"],
 
                         "value":
                             round(
-                                float(
-                                    count
-                                )
-                                / total
-                                * 100,
+                                (
+                                    float(
+                                        count
+                                    )
+                                    / total
+                                    * 100
+                                ),
                                 1,
                             ),
 
                         "color":
-                            info[
-                                "color"
-                            ],
+                            info["color"],
                     }
                 )
-
 
         land_cover.sort(
             key=lambda x: x[
@@ -589,37 +730,23 @@ def analyze(req: AnalyzeRequest):
             reverse=True,
         )
 
-
-        # ----------------------------------------------------
+        # ------------------------------------------------------
         # NDVI HEALTH
-        # ----------------------------------------------------
+        # ------------------------------------------------------
 
         avg_ndvi = float(
             np.nanmean(ndvi)
         )
 
-        if avg_ndvi > 0.5:
-
-            vegetation_health = (
-                "healthy"
+        vegetation_health = (
+            classify_vegetation_health(
+                avg_ndvi
             )
+        )
 
-        elif avg_ndvi > 0.2:
-
-            vegetation_health = (
-                "moderate"
-            )
-
-        else:
-
-            vegetation_health = (
-                "sparse/stressed"
-            )
-
-
-        # ----------------------------------------------------
-        # TRUE-COLOR IMAGE
-        # ----------------------------------------------------
+        # ------------------------------------------------------
+        # TRUE COLOR IMAGE
+        # ------------------------------------------------------
 
         print(
             "Creating satellite preview..."
@@ -633,10 +760,9 @@ def analyze(req: AnalyzeRequest):
             )
         )
 
-
-        # ----------------------------------------------------
+        # ------------------------------------------------------
         # RESPONSE
-        # ----------------------------------------------------
+        # ------------------------------------------------------
 
         response = {
 
@@ -648,7 +774,8 @@ def analyze(req: AnalyzeRequest):
             "scene": {
                 "id": item.id,
 
-                "date": scene_datetime,
+                "date":
+                    scene_datetime,
 
                 "cloud_cover":
                     float(
@@ -670,16 +797,13 @@ def analyze(req: AnalyzeRequest):
 
             "vegetation_health":
                 vegetation_health,
-
         }
-
 
         print(
             "Analysis completed successfully."
         )
 
         return response
-
 
     except Exception as e:
 
@@ -695,3 +819,384 @@ def analyze(req: AnalyzeRequest):
                 + str(e)
             ),
         )
+
+
+# ============================================================
+# NDVI HISTORY
+# ============================================================
+
+@app.get("/ndvi-history")
+def ndvi_history(
+    lat: float,
+    lon: float,
+):
+
+    validate_coordinates(
+        lat,
+        lon,
+    )
+
+    print("\n==========================================")
+    print("NDVI HISTORY REQUEST")
+    print("Latitude:", lat)
+    print("Longitude:", lon)
+    print("==========================================")
+
+    bbox = make_bbox(
+        lat,
+        lon,
+    )
+
+    # --------------------------------------------------------
+    # DATE WINDOW
+    # --------------------------------------------------------
+
+    end_date = date.today()
+
+    start_date = (
+        end_date
+        - timedelta(
+            days=HISTORY_DAYS
+        )
+    )
+
+    history_range = (
+        f"{start_date.isoformat()}/"
+        f"{end_date.isoformat()}"
+    )
+
+    print(
+        "Historical range:",
+        history_range,
+    )
+
+    try:
+
+        # ----------------------------------------------------
+        # SEARCH HISTORICAL SCENES
+        # ----------------------------------------------------
+
+        search = catalog.search(
+            collections=[
+                "sentinel-2-l2a"
+            ],
+            bbox=bbox,
+            datetime=history_range,
+            query={
+                "eo:cloud_cover": {
+                    "lt": MAX_CLOUD,
+                }
+            },
+            max_items=100,
+        )
+
+        items = list(
+            search.items()
+        )
+
+        if not items:
+
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    "No historical Sentinel-2 "
+                    "observations found for this location."
+                ),
+            )
+
+        # ----------------------------------------------------
+        # GROUP BY MONTH
+        #
+        # We choose one scene per month.
+        # Within each month, choose the scene
+        # with the lowest cloud cover.
+        # ----------------------------------------------------
+
+        monthly_candidates = {}
+
+        for item in items:
+
+            scene_datetime = (
+                item.properties.get(
+                    "datetime"
+                )
+            )
+
+            if not scene_datetime:
+                continue
+
+            scene_date = (
+                scene_datetime[:10]
+            )
+
+            month_key = (
+                scene_date[:7]
+            )
+
+            cloud = (
+                item.properties.get(
+                    "eo:cloud_cover"
+                )
+            )
+
+            if cloud is None:
+                cloud = 100
+
+            current = (
+                monthly_candidates.get(
+                    month_key
+                )
+            )
+
+            if (
+                current is None
+                or cloud
+                < current["cloud_cover"]
+            ):
+
+                monthly_candidates[
+                    month_key
+                ] = {
+                    "item": item,
+                    "cloud_cover": float(
+                        cloud
+                    ),
+                    "date": scene_datetime,
+                }
+
+        # ----------------------------------------------------
+        # TAKE MOST RECENT MONTHS
+        # ----------------------------------------------------
+
+        selected_months = sorted(
+            monthly_candidates.keys(),
+            reverse=True,
+        )[
+            :HISTORY_POINTS
+        ]
+
+        selected_months.sort()
+
+        print(
+            "Selected months:",
+            selected_months,
+        )
+
+        # ----------------------------------------------------
+        # CALCULATE NDVI
+        # ----------------------------------------------------
+
+        observations = []
+
+        for month in selected_months:
+
+            candidate = (
+                monthly_candidates[
+                    month
+                ]
+            )
+
+            item = candidate[
+                "item"
+            ]
+
+            print(
+                "Processing historical scene:",
+                item.id,
+                candidate["date"],
+            )
+
+            try:
+
+                _ndvi, avg_ndvi = (
+                    calculate_scene_ndvi(
+                        item,
+                        bbox,
+                    )
+                )
+
+                observations.append(
+                    {
+                        "date":
+                            candidate[
+                                "date"
+                            ],
+
+                        "period":
+                            month,
+
+                        "ndvi":
+                            round(
+                                avg_ndvi,
+                                3,
+                            ),
+
+                        "cloud_cover":
+                            round(
+                                candidate[
+                                    "cloud_cover"
+                                ],
+                                1,
+                            ),
+
+                        "scene_id":
+                            item.id,
+                    }
+                )
+
+            except Exception as scene_error:
+
+                print(
+                    "Skipping historical scene:",
+                    item.id,
+                    str(scene_error),
+                )
+
+                continue
+
+        if not observations:
+
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    "Historical scenes were found, "
+                    "but valid NDVI could not be calculated."
+                ),
+            )
+
+        # ----------------------------------------------------
+        # SORT CHRONOLOGICALLY
+        # ----------------------------------------------------
+
+        observations.sort(
+            key=lambda x: x["date"]
+        )
+
+        # ----------------------------------------------------
+        # TREND SUMMARY
+        # ----------------------------------------------------
+
+        first_ndvi = (
+            observations[0]["ndvi"]
+        )
+
+        latest_ndvi = (
+            observations[-1]["ndvi"]
+        )
+
+        change = (
+            latest_ndvi
+            - first_ndvi
+        )
+
+        if change > 0.05:
+            trend = "increasing"
+
+        elif change < -0.05:
+            trend = "decreasing"
+
+        else:
+            trend = "stable"
+
+        # ----------------------------------------------------
+        # RESPONSE
+        # ----------------------------------------------------
+
+        response = {
+
+            "coordinates": {
+                "lat": lat,
+                "lon": lon,
+            },
+
+            "period": {
+                "start":
+                    observations[
+                        0
+                    ]["date"],
+
+                "end":
+                    observations[
+                        -1
+                    ]["date"],
+            },
+
+            "observations":
+                observations,
+
+            "summary": {
+
+                "first_ndvi":
+                    round(
+                        first_ndvi,
+                        3,
+                    ),
+
+                "latest_ndvi":
+                    round(
+                        latest_ndvi,
+                        3,
+                    ),
+
+                "change":
+                    round(
+                        change,
+                        3,
+                    ),
+
+                "trend":
+                    trend,
+
+                "observation_count":
+                    len(
+                        observations
+                    ),
+            },
+        }
+
+        print(
+            "NDVI history completed:",
+            len(observations),
+            "observations",
+        )
+
+        return response
+
+    except HTTPException:
+        raise
+
+    except Exception as e:
+
+        print(
+            "NDVI HISTORY ERROR:",
+            str(e),
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "NDVI history failed: "
+                + str(e)
+            ),
+        )
+
+
+# ============================================================
+# ROOT
+# ============================================================
+
+@app.get("/")
+def root():
+    return {
+        "service":
+            "Team Kanyarasi Satellite Intelligence API",
+
+        "status":
+            "running",
+
+        "endpoints": [
+            "/health",
+            "/analyze",
+            "/ndvi-history",
+        ],
+    }
