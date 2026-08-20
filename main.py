@@ -7,12 +7,19 @@ GET  /health
 POST /analyze
 GET  /ndvi-history?lat=<lat>&lon=<lon>
 
-The /analyze endpoint returns the latest suitable Sentinel-2
-scene and runs the Random Forest land-cover model.
+The /analyze endpoint:
+    - retrieves the latest suitable Sentinel-2 scene
+    - creates enhanced true-color imagery
+    - calculates NDVI
+    - runs Random Forest land-cover classification
+    - calculates vegetation health
+    - calculates a satellite-derived field-condition indicator
 
-The /ndvi-history endpoint retrieves real historical Sentinel-2
-observations for the selected coordinate and calculates NDVI
-from the Red (B04) and NIR (B08) bands.
+The /ndvi-history endpoint:
+    - retrieves historical Sentinel-2 scenes
+    - selects one suitable scene per month
+    - calculates real NDVI from B04 and B08
+    - returns temporal trend information
 """
 
 import base64
@@ -111,7 +118,7 @@ WORLDCOVER_CLASSES = {
 
 app = FastAPI(
     title="Team Kanyarasi Satellite Intelligence API",
-    version="1.2.0",
+    version="1.3.0",
 )
 
 
@@ -213,7 +220,7 @@ def health():
     return {
         "status": "ok",
         "service": "team-kanyarasi-inference",
-        "version": "1.2.0",
+        "version": "1.3.0",
     }
 
 
@@ -410,6 +417,7 @@ def calculate_scene_ndvi(
 ):
     """
     Calculate average NDVI from:
+
         B04 = Red
         B08 = NIR
 
@@ -485,22 +493,207 @@ def classify_vegetation_health(
 
 
 # ============================================================
+# SOIL / FIELD CONDITION
+# ============================================================
+
+def calculate_soil_condition(
+    avg_ndvi: float,
+    ndvi: np.ndarray,
+    land_cover: list,
+):
+    """
+    Calculate a satellite-derived field-condition indicator.
+
+    IMPORTANT:
+    This is NOT a laboratory soil measurement.
+
+    It does not directly measure:
+        - soil pH
+        - NPK
+        - volumetric soil moisture
+
+    Instead it combines:
+        1. vegetation signal from NDVI
+        2. bare/sparse vegetation proportion
+        3. spatial vegetation consistency
+
+    This is intended as a software-first prototype
+    indicator for field-condition monitoring.
+    """
+
+    # --------------------------------------------------------
+    # 1. VEGETATION SIGNAL
+    # --------------------------------------------------------
+
+    vegetation_signal = round(
+        max(
+            0,
+            min(
+                100,
+                avg_ndvi * 100,
+            ),
+        )
+    )
+
+    # --------------------------------------------------------
+    # 2. BARE / SPARSE COVER
+    # --------------------------------------------------------
+
+    bare_percentage = 0.0
+
+    for item in land_cover:
+
+        if (
+            item["name"]
+            == "Bare / sparse vegetation"
+        ):
+
+            bare_percentage = float(
+                item["value"]
+            )
+
+            break
+
+    # High bare/sparse percentage reduces
+    # field-condition confidence.
+
+    bare_soil_indicator = round(
+        max(
+            0,
+            min(
+                100,
+                100 - (
+                    bare_percentage * 2
+                ),
+            ),
+        )
+    )
+
+    # --------------------------------------------------------
+    # 3. SPATIAL VEGETATION CONSISTENCY
+    # --------------------------------------------------------
+
+    valid_ndvi = ndvi[
+        np.isfinite(ndvi)
+    ]
+
+    if valid_ndvi.size == 0:
+
+        consistency = 50
+
+    else:
+
+        ndvi_std = float(
+            np.std(
+                valid_ndvi
+            )
+        )
+
+        # Lower variation means more consistent
+        # vegetation across the analyzed AOI.
+
+        consistency = round(
+            max(
+                0,
+                min(
+                    100,
+                    100 - (
+                        ndvi_std * 250
+                    ),
+                ),
+            )
+        )
+
+    # --------------------------------------------------------
+    # 4. OVERALL SCORE
+    # --------------------------------------------------------
+
+    score = round(
+        (
+            vegetation_signal * 0.50
+            + bare_soil_indicator * 0.20
+            + consistency * 0.30
+        )
+    )
+
+    score = max(
+        0,
+        min(
+            100,
+            score,
+        ),
+    )
+
+    # --------------------------------------------------------
+    # 5. STATUS
+    # --------------------------------------------------------
+
+    if score >= 70:
+
+        status = "good"
+
+    elif score >= 40:
+
+        status = "moderate"
+
+    else:
+
+        status = "stressed"
+
+    return {
+        "score": score,
+
+        "status": status,
+
+        "vegetation_signal":
+            vegetation_signal,
+
+      "bare_sparse_cover":
+    round(
+        bare_percentage,
+        1,
+    ),
+
+        "spatial_consistency":
+            consistency,
+    }
+
+
+# ============================================================
 # ANALYZE
 # ============================================================
 
 @app.post("/analyze")
-def analyze(req: AnalyzeRequest):
+def analyze(
+    req: AnalyzeRequest,
+):
 
     validate_coordinates(
         req.lat,
         req.lon,
     )
 
-    print("\n==========================================")
-    print("NEW ANALYSIS REQUEST")
-    print("Latitude:", req.lat)
-    print("Longitude:", req.lon)
-    print("==========================================")
+    print(
+        "\n=========================================="
+    )
+
+    print(
+        "NEW ANALYSIS REQUEST"
+    )
+
+    print(
+        "Latitude:",
+        req.lat,
+    )
+
+    print(
+        "Longitude:",
+        req.lon,
+    )
+
+    print(
+        "=========================================="
+    )
 
     bbox = make_bbox(
         req.lat,
@@ -515,13 +708,17 @@ def analyze(req: AnalyzeRequest):
         collections=[
             "sentinel-2-l2a"
         ],
+
         bbox=bbox,
+
         datetime=DATE_RANGE,
+
         query={
             "eo:cloud_cover": {
                 "lt": MAX_CLOUD,
             }
         },
+
         max_items=10,
     )
 
@@ -530,6 +727,7 @@ def analyze(req: AnalyzeRequest):
     )
 
     if not items:
+
         raise HTTPException(
             status_code=404,
             detail=(
@@ -539,6 +737,7 @@ def analyze(req: AnalyzeRequest):
         )
 
     # Newest scene first
+
     items.sort(
         key=lambda x: (
             x.properties.get(
@@ -566,16 +765,30 @@ def analyze(req: AnalyzeRequest):
     if cloud_cover is None:
         cloud_cover = 0
 
-    print("Scene selected:")
-    print("Scene:", item.id)
-    print("Date:", scene_datetime)
-    print("Cloud:", cloud_cover)
+    print(
+        "Scene selected:"
+    )
+
+    print(
+        "Scene:",
+        item.id,
+    )
+
+    print(
+        "Date:",
+        scene_datetime,
+    )
+
+    print(
+        "Cloud:",
+        cloud_cover,
+    )
 
     try:
 
-        # ------------------------------------------------------
+        # ====================================================
         # LOAD RGB + NIR
-        # ------------------------------------------------------
+        # ====================================================
 
         bands = {}
 
@@ -621,9 +834,9 @@ def analyze(req: AnalyzeRequest):
             "float32"
         )
 
-        # ------------------------------------------------------
+        # ====================================================
         # NDVI
-        # ------------------------------------------------------
+        # ====================================================
 
         ndvi = (
             (nir - red)
@@ -634,9 +847,15 @@ def analyze(req: AnalyzeRequest):
             )
         )
 
-        # ------------------------------------------------------
+        ndvi = np.where(
+            np.isfinite(ndvi),
+            ndvi,
+            np.nan,
+        )
+
+        # ====================================================
         # ML FEATURES
-        # ------------------------------------------------------
+        # ====================================================
 
         X = np.stack(
             [
@@ -658,9 +877,9 @@ def analyze(req: AnalyzeRequest):
             )
         )
 
-        # ------------------------------------------------------
+        # ====================================================
         # ML PREDICTION
-        # ------------------------------------------------------
+        # ====================================================
 
         print(
             "Running Random Forest..."
@@ -670,9 +889,9 @@ def analyze(req: AnalyzeRequest):
             X[valid]
         )
 
-        # ------------------------------------------------------
+        # ====================================================
         # LAND COVER
-        # ------------------------------------------------------
+        # ====================================================
 
         unique, counts = np.unique(
             preds,
@@ -704,7 +923,9 @@ def analyze(req: AnalyzeRequest):
                 land_cover.append(
                     {
                         "name":
-                            info["name"],
+                            info[
+                                "name"
+                            ],
 
                         "value":
                             round(
@@ -719,7 +940,9 @@ def analyze(req: AnalyzeRequest):
                             ),
 
                         "color":
-                            info["color"],
+                            info[
+                                "color"
+                            ],
                     }
                 )
 
@@ -730,12 +953,14 @@ def analyze(req: AnalyzeRequest):
             reverse=True,
         )
 
-        # ------------------------------------------------------
+        # ====================================================
         # NDVI HEALTH
-        # ------------------------------------------------------
+        # ====================================================
 
         avg_ndvi = float(
-            np.nanmean(ndvi)
+            np.nanmean(
+                ndvi
+            )
         )
 
         vegetation_health = (
@@ -744,9 +969,30 @@ def analyze(req: AnalyzeRequest):
             )
         )
 
-        # ------------------------------------------------------
+        # ====================================================
+        # SOIL / FIELD CONDITION
+        # ====================================================
+
+        print(
+            "Calculating satellite-derived field condition..."
+        )
+
+        soil_condition = (
+            calculate_soil_condition(
+                avg_ndvi=avg_ndvi,
+                ndvi=ndvi,
+                land_cover=land_cover,
+            )
+        )
+
+        print(
+            "Field condition:",
+            soil_condition,
+        )
+
+        # ====================================================
         # TRUE COLOR IMAGE
-        # ------------------------------------------------------
+        # ====================================================
 
         print(
             "Creating satellite preview..."
@@ -760,9 +1006,9 @@ def analyze(req: AnalyzeRequest):
             )
         )
 
-        # ------------------------------------------------------
+        # ====================================================
         # RESPONSE
-        # ------------------------------------------------------
+        # ====================================================
 
         response = {
 
@@ -797,6 +1043,9 @@ def analyze(req: AnalyzeRequest):
 
             "vegetation_health":
                 vegetation_health,
+
+            "soil_condition":
+                soil_condition,
         }
 
         print(
@@ -836,11 +1085,27 @@ def ndvi_history(
         lon,
     )
 
-    print("\n==========================================")
-    print("NDVI HISTORY REQUEST")
-    print("Latitude:", lat)
-    print("Longitude:", lon)
-    print("==========================================")
+    print(
+        "\n=========================================="
+    )
+
+    print(
+        "NDVI HISTORY REQUEST"
+    )
+
+    print(
+        "Latitude:",
+        lat,
+    )
+
+    print(
+        "Longitude:",
+        lon,
+    )
+
+    print(
+        "=========================================="
+    )
 
     bbox = make_bbox(
         lat,
@@ -880,13 +1145,17 @@ def ndvi_history(
             collections=[
                 "sentinel-2-l2a"
             ],
+
             bbox=bbox,
+
             datetime=history_range,
+
             query={
                 "eo:cloud_cover": {
                     "lt": MAX_CLOUD,
                 }
             },
+
             max_items=100,
         )
 
@@ -906,10 +1175,6 @@ def ndvi_history(
 
         # ----------------------------------------------------
         # GROUP BY MONTH
-        #
-        # We choose one scene per month.
-        # Within each month, choose the scene
-        # with the lowest cloud cover.
         # ----------------------------------------------------
 
         monthly_candidates = {}
@@ -951,17 +1216,23 @@ def ndvi_history(
             if (
                 current is None
                 or cloud
-                < current["cloud_cover"]
+                < current[
+                    "cloud_cover"
+                ]
             ):
 
                 monthly_candidates[
                     month_key
                 ] = {
                     "item": item,
-                    "cloud_cover": float(
-                        cloud
-                    ),
-                    "date": scene_datetime,
+
+                    "cloud_cover":
+                        float(
+                            cloud
+                        ),
+
+                    "date":
+                        scene_datetime,
                 }
 
         # ----------------------------------------------------
@@ -1049,7 +1320,9 @@ def ndvi_history(
                 print(
                     "Skipping historical scene:",
                     item.id,
-                    str(scene_error),
+                    str(
+                        scene_error
+                    ),
                 )
 
                 continue
@@ -1069,7 +1342,9 @@ def ndvi_history(
         # ----------------------------------------------------
 
         observations.sort(
-            key=lambda x: x["date"]
+            key=lambda x: x[
+                "date"
+            ]
         )
 
         # ----------------------------------------------------
@@ -1077,11 +1352,15 @@ def ndvi_history(
         # ----------------------------------------------------
 
         first_ndvi = (
-            observations[0]["ndvi"]
+            observations[0][
+                "ndvi"
+            ]
         )
 
         latest_ndvi = (
-            observations[-1]["ndvi"]
+            observations[-1][
+                "ndvi"
+            ]
         )
 
         change = (
@@ -1090,12 +1369,15 @@ def ndvi_history(
         )
 
         if change > 0.05:
+
             trend = "increasing"
 
         elif change < -0.05:
+
             trend = "decreasing"
 
         else:
+
             trend = "stable"
 
         # ----------------------------------------------------
@@ -1156,7 +1438,9 @@ def ndvi_history(
 
         print(
             "NDVI history completed:",
-            len(observations),
+            len(
+                observations
+            ),
             "observations",
         )
 
@@ -1193,6 +1477,9 @@ def root():
 
         "status":
             "running",
+
+        "version":
+            "1.3.0",
 
         "endpoints": [
             "/health",
