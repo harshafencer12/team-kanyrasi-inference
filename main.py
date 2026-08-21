@@ -7,19 +7,28 @@ GET  /health
 POST /analyze
 GET  /ndvi-history?lat=<lat>&lon=<lon>
 
-The /analyze endpoint:
-    - retrieves the latest suitable Sentinel-2 scene
-    - creates enhanced true-color imagery
-    - calculates NDVI
-    - runs Random Forest land-cover classification
-    - calculates vegetation health
-    - calculates satellite-derived field condition
-    - retrieves historical NDVI information
-    - calculates temporal vegetation trend
-    - calculates crop stress / pest-risk early warning
-    - calculates a compact spatial NDVI / stress map
+Architecture:
 
-Memory-optimized for small cloud instances.
+/analyze
+    -> latest Sentinel-2 scene
+    -> NDVI
+    -> vegetation health
+    -> compact spatial NDVI/stress map
+    -> Random Forest land-cover classification
+    -> field condition
+    -> fast crop-stress early warning
+    -> true-color preview
+
+/ndvi-history
+    -> historical Sentinel-2 search
+    -> one suitable observation per month
+    -> real NDVI calculation
+    -> temporal trend
+
+IMPORTANT:
+Historical processing is intentionally NOT performed inside
+/analyze so the main analysis remains responsive on small
+cloud instances.
 """
 
 import base64
@@ -49,34 +58,51 @@ CATALOG_URL = (
     "https://planetarycomputer.microsoft.com/api/stac/v1"
 )
 
-# Current Sentinel-2 search window
 DATE_RANGE = (
     f"2025-08-01/{date.today().isoformat()}"
 )
 
-# Historical NDVI period
 HISTORY_DAYS = 365
 
-# Number of historical monthly observations
 HISTORY_POINTS = 12
 
-# Maximum acceptable scene-level cloud cover
 MAX_CLOUD = 30
 
-# Approx. 3 km x 3 km analysis window
 BUFFER_DEG = 0.03
 
-# Spatial stress grid
-SPATIAL_GRID_SIZE = 12
+# ------------------------------------------------------------
+# Spatial map
+# ------------------------------------------------------------
 
-# Random Forest prediction chunk size
-ML_CHUNK_SIZE = 10000
+# 8 x 8 = 64 cells.
+# Enough visual detail for the UI while keeping the response
+# small and fast.
+SPATIAL_GRID_SIZE = 8
 
-# Satellite preview maximum dimension
-IMAGE_MAX_DIMENSION = 1024
+# ------------------------------------------------------------
+# Random Forest
+# ------------------------------------------------------------
 
-# JPEG quality
-IMAGE_JPEG_QUALITY = 82
+# Process model features in chunks.
+ML_CHUNK_SIZE = 20000
+
+# Do not classify every single raster pixel.
+#
+# A stride of 2 means:
+#   every second row
+#   every second column
+#
+# This dramatically reduces Random Forest CPU usage while
+# preserving a representative land-cover estimate.
+ML_PIXEL_STRIDE = 2
+
+# ------------------------------------------------------------
+# Image
+# ------------------------------------------------------------
+
+IMAGE_MAX_DIMENSION = 768
+
+IMAGE_JPEG_QUALITY = 78
 
 
 # ============================================================
@@ -133,7 +159,7 @@ WORLDCOVER_CLASSES = {
 
 app = FastAPI(
     title="Team Kanyarasi Satellite Intelligence API",
-    version="1.7.0",
+    version="1.8.0",
 )
 
 
@@ -145,10 +171,11 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:5173",
+        "http://127.0.0.1:5173",
         "https://verdant-croissant-7eb837.netlify.app",
     ],
-    allow_credentials=True,
-    allow_methods=["*"],
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
 
@@ -227,7 +254,7 @@ def make_bbox(
 
 
 # ============================================================
-# HEALTH CHECK
+# HEALTH
 # ============================================================
 
 @app.get("/health")
@@ -235,21 +262,20 @@ def health():
     return {
         "status": "ok",
         "service": "team-kanyarasi-inference",
-        "version": "1.7.0",
+        "version": "1.8.0",
+        "memory_optimized": True,
+        "spatial_grid": f"{SPATIAL_GRID_SIZE}x{SPATIAL_GRID_SIZE}",
+        "historical_processing_in_analyze": False,
     }
 
 
 # ============================================================
-# RGB IMAGE PROCESSING
+# IMAGE PROCESSING
 # ============================================================
 
 def enhance_channel(
     channel: np.ndarray,
 ):
-    """
-    Improve visual contrast using percentile stretching.
-    """
-
     channel = np.asarray(
         channel,
         dtype=np.float32,
@@ -281,14 +307,14 @@ def enhance_channel(
             dtype=np.float32,
         )
 
-    channel = (
+    normalized = (
         channel - low
     ) / (
         high - low + 1e-6
     )
 
     return np.clip(
-        channel,
+        normalized,
         0,
         1,
     )
@@ -300,16 +326,12 @@ def create_rgb_image(
     blue: np.ndarray,
 ):
     """
-    Create a compact enhanced true-color preview.
+    Create compact true-color Sentinel-2 preview.
 
     B04 = Red
     B03 = Green
     B02 = Blue
     """
-
-    # --------------------------------------------------------
-    # Downsample before image processing
-    # --------------------------------------------------------
 
     height, width = red.shape
 
@@ -331,13 +353,20 @@ def create_rgb_image(
     else:
         step = 1
 
-    red_small = red[::step, ::step]
-    green_small = green[::step, ::step]
-    blue_small = blue[::step, ::step]
+    red_small = red[
+        ::step,
+        ::step,
+    ]
 
-    # --------------------------------------------------------
-    # Enhance
-    # --------------------------------------------------------
+    green_small = green[
+        ::step,
+        ::step,
+    ]
+
+    blue_small = blue[
+        ::step,
+        ::step,
+    ]
 
     red_small = enhance_channel(
         red_small
@@ -368,10 +397,6 @@ def create_rgb_image(
         gamma,
     )
 
-    # --------------------------------------------------------
-    # Stack RGB
-    # --------------------------------------------------------
-
     rgb = np.stack(
         [
             red_small,
@@ -394,10 +419,6 @@ def create_rgb_image(
         mode="RGB",
     )
 
-    # --------------------------------------------------------
-    # Resize if still required
-    # --------------------------------------------------------
-
     if (
         max(image.size)
         > IMAGE_MAX_DIMENSION
@@ -408,31 +429,25 @@ def create_rgb_image(
             / max(image.size)
         )
 
-        new_size = (
-            max(
-                1,
-                int(
-                    image.size[0]
-                    * scale
-                ),
-            ),
-            max(
-                1,
-                int(
-                    image.size[1]
-                    * scale
-                ),
-            ),
-        )
-
         image = image.resize(
-            new_size,
+            (
+                max(
+                    1,
+                    int(
+                        image.size[0]
+                        * scale
+                    ),
+                ),
+                max(
+                    1,
+                    int(
+                        image.size[1]
+                        * scale
+                    ),
+                ),
+            ),
             Image.Resampling.LANCZOS,
         )
-
-    # --------------------------------------------------------
-    # JPEG
-    # --------------------------------------------------------
 
     buffer = io.BytesIO()
 
@@ -454,7 +469,7 @@ def create_rgb_image(
 
 
 # ============================================================
-# LOAD SINGLE BAND
+# LOAD BAND
 # ============================================================
 
 def load_band(
@@ -463,10 +478,11 @@ def load_band(
     bbox,
 ):
     """
-    Load and clip one Sentinel-2 band.
+    Load a single Sentinel-2 band and immediately return
+    its NumPy representation.
 
-    Returns only the NumPy array so the raster dataset
-    can be released immediately.
+    Planetary Computer assets are signed automatically through
+    planetary_computer.sign_inplace.
     """
 
     if band_name not in item.assets:
@@ -484,6 +500,8 @@ def load_band(
             band_name
         ].href
     )
+
+    clipped = None
 
     try:
 
@@ -503,10 +521,8 @@ def load_band(
 
         del raster
 
-        try:
+        if clipped is not None:
             del clipped
-        except Exception:
-            pass
 
         gc.collect()
 
@@ -519,10 +535,6 @@ def calculate_ndvi(
     red: np.ndarray,
     nir: np.ndarray,
 ):
-    """
-    Calculate NDVI.
-    """
-
     denominator = (
         nir
         + red
@@ -545,61 +557,6 @@ def calculate_ndvi(
     )
 
 
-def calculate_scene_ndvi(
-    item,
-    bbox,
-):
-    """
-    Calculate average NDVI for one scene.
-
-    Only Red and NIR are loaded.
-    """
-
-    red = load_band(
-        item,
-        "B04",
-        bbox,
-    )
-
-    nir = load_band(
-        item,
-        "B08",
-        bbox,
-    )
-
-    try:
-
-        ndvi = calculate_ndvi(
-            red,
-            nir,
-        )
-
-        valid = ndvi[
-            np.isfinite(ndvi)
-        ]
-
-        if valid.size == 0:
-            raise RuntimeError(
-                "No valid NDVI pixels found."
-            )
-
-        avg_ndvi = float(
-            np.mean(valid)
-        )
-
-        return (
-            ndvi,
-            avg_ndvi,
-        )
-
-    finally:
-
-        del red
-        del nir
-
-        gc.collect()
-
-
 # ============================================================
 # VEGETATION HEALTH
 # ============================================================
@@ -618,16 +575,12 @@ def classify_vegetation_health(
 
 
 # ============================================================
-# SPATIAL STRESS MAP
+# SPATIAL CELL CLASSIFICATION
 # ============================================================
 
 def classify_spatial_cell(
     ndvi_value: float,
 ):
-    """
-    Convert NDVI into a decision-support stress category.
-    """
-
     if not np.isfinite(
         ndvi_value
     ):
@@ -644,9 +597,10 @@ def classify_spatial_cell(
             "stress": round(
                 max(
                     0,
-                    100
-                    - (
-                        ndvi_value * 100
+                    min(
+                        100,
+                        100
+                        - ndvi_value * 100,
                     ),
                 )
             ),
@@ -724,21 +678,19 @@ def classify_spatial_cell(
     }
 
 
+# ============================================================
+# SPATIAL ANALYSIS
+# ============================================================
+
 def calculate_spatial_analysis(
     ndvi: np.ndarray,
     bbox,
 ):
     """
-    Convert the actual NDVI raster into a compact 12x12
-    geographic stress grid.
+    Create a compact 8x8 spatial NDVI/stress grid from the
+    actual Sentinel-2 NDVI raster.
 
-    Each cell contains:
-        row
-        col
-        ndvi
-        stress
-        category
-        geographic bounds
+    No extra satellite request is required.
     """
 
     valid = ndvi[
@@ -787,61 +739,47 @@ def calculate_spatial_analysis(
         "no-data": 0,
     }
 
-    # --------------------------------------------------------
-    # Create grid
-    # --------------------------------------------------------
-
     for row in range(
         target_rows
     ):
 
         row_start = int(
-            round(
-                row
-                * rows
-                / target_rows
-            )
+            row
+            * rows
+            / target_rows
         )
 
         row_end = int(
-            round(
-                (row + 1)
-                * rows
-                / target_rows
-            )
+            (row + 1)
+            * rows
+            / target_rows
         )
 
-        if row_end <= row_start:
-            row_end = min(
-                rows,
-                row_start + 1,
-            )
+        row_end = max(
+            row_end,
+            row_start + 1,
+        )
 
         for col in range(
             target_cols
         ):
 
             col_start = int(
-                round(
-                    col
-                    * cols
-                    / target_cols
-                )
+                col
+                * cols
+                / target_cols
             )
 
             col_end = int(
-                round(
-                    (col + 1)
-                    * cols
-                    / target_cols
-                )
+                (col + 1)
+                * cols
+                / target_cols
             )
 
-            if col_end <= col_start:
-                col_end = min(
-                    cols,
-                    col_start + 1,
-                )
+            col_end = max(
+                col_end,
+                col_start + 1,
+            )
 
             block = ndvi[
                 row_start:row_end,
@@ -935,39 +873,6 @@ def calculate_spatial_analysis(
             "No valid spatial cells generated."
         )
 
-    healthy_percent = (
-        counts["healthy"]
-        / valid_cells
-        * 100
-    )
-
-    moderate_percent = (
-        counts["moderate"]
-        / valid_cells
-        * 100
-    )
-
-    stressed_percent = (
-        counts["stressed"]
-        / valid_cells
-        * 100
-    )
-
-    high_stress_percent = (
-        counts["high-stress"]
-        / valid_cells
-        * 100
-    )
-
-    elevated_stress_percent = (
-        (
-            counts["stressed"]
-            + counts["high-stress"]
-        )
-        / valid_cells
-        * 100
-    )
-
     return {
         "grid_size": {
             "rows": target_rows,
@@ -980,33 +885,54 @@ def calculate_spatial_analysis(
         ),
 
         "bounds": {
-            "south": float(min_lat),
-            "north": float(max_lat),
-            "west": float(min_lon),
-            "east": float(max_lon),
+            "south": float(
+                min_lat
+            ),
+            "north": float(
+                max_lat
+            ),
+            "west": float(
+                min_lon
+            ),
+            "east": float(
+                max_lon
+            ),
         },
 
         "cells": cells,
 
         "summary": {
             "healthy_percent": round(
-                healthy_percent,
+                counts["healthy"]
+                / valid_cells
+                * 100,
                 1,
             ),
             "moderate_percent": round(
-                moderate_percent,
+                counts["moderate"]
+                / valid_cells
+                * 100,
                 1,
             ),
             "stressed_percent": round(
-                stressed_percent,
+                counts["stressed"]
+                / valid_cells
+                * 100,
                 1,
             ),
             "high_stress_percent": round(
-                high_stress_percent,
+                counts["high-stress"]
+                / valid_cells
+                * 100,
                 1,
             ),
             "elevated_stress_percent": round(
-                elevated_stress_percent,
+                (
+                    counts["stressed"]
+                    + counts["high-stress"]
+                )
+                / valid_cells
+                * 100,
                 1,
             ),
             "valid_cells": valid_cells,
@@ -1018,7 +944,7 @@ def calculate_spatial_analysis(
 
 
 # ============================================================
-# SOIL / FIELD CONDITION
+# FIELD CONDITION
 # ============================================================
 
 def calculate_soil_condition(
@@ -1029,7 +955,7 @@ def calculate_soil_condition(
     """
     Satellite-derived field-condition indicator.
 
-    This is NOT a direct laboratory soil measurement.
+    This is NOT a laboratory soil measurement.
     """
 
     vegetation_signal = round(
@@ -1063,9 +989,7 @@ def calculate_soil_condition(
             min(
                 100,
                 100
-                - (
-                    bare_percentage * 2
-                ),
+                - bare_percentage * 2,
             ),
         )
     )
@@ -1092,19 +1016,15 @@ def calculate_soil_condition(
                 min(
                     100,
                     100
-                    - (
-                        ndvi_std * 250
-                    ),
+                    - ndvi_std * 250,
                 ),
             )
         )
 
     score = round(
-        (
-            vegetation_signal * 0.50
-            + bare_soil_condition * 0.20
-            + consistency * 0.30
-        )
+        vegetation_signal * 0.50
+        + bare_soil_condition * 0.20
+        + consistency * 0.30
     )
 
     score = max(
@@ -1137,6 +1057,457 @@ def calculate_soil_condition(
 
 
 # ============================================================
+# FAST STRESS RISK
+# ============================================================
+
+def calculate_fast_stress_risk(
+    avg_ndvi: float,
+    soil_condition: dict,
+    cloud_cover: float,
+):
+    """
+    Fast current-scene stress indicator.
+
+    Historical trend is deliberately excluded from /analyze.
+    The frontend can combine this with /ndvi-history.
+    """
+
+    vegetation_stress = round(
+        max(
+            0,
+            min(
+                100,
+                (
+                    (
+                        0.7
+                        - avg_ndvi
+                    )
+                    / 0.7
+                )
+                * 100,
+            ),
+        )
+    )
+
+    spatial_consistency = int(
+        soil_condition.get(
+            "spatial_consistency",
+            50,
+        )
+    )
+
+    spatial_stress = round(
+        max(
+            0,
+            min(
+                100,
+                100
+                - spatial_consistency,
+            ),
+        )
+    )
+
+    field_condition_score = int(
+        soil_condition.get(
+            "score",
+            50,
+        )
+    )
+
+    field_condition_stress = round(
+        max(
+            0,
+            min(
+                100,
+                100
+                - field_condition_score,
+            ),
+        )
+    )
+
+    bare_sparse_cover = float(
+        soil_condition.get(
+            "bare_sparse_cover",
+            0,
+        )
+    )
+
+    bare_cover_stress = round(
+        max(
+            0,
+            min(
+                100,
+                bare_sparse_cover * 2,
+            ),
+        )
+    )
+
+    observation_quality = round(
+        max(
+            0,
+            min(
+                100,
+                100 - cloud_cover,
+            ),
+        )
+    )
+
+    risk_score = round(
+        vegetation_stress * 0.45
+        + field_condition_stress * 0.25
+        + spatial_stress * 0.15
+        + bare_cover_stress * 0.15
+    )
+
+    risk_score = max(
+        0,
+        min(
+            100,
+            risk_score,
+        ),
+    )
+
+    if risk_score >= 70:
+
+        risk_level = "high"
+
+    elif risk_score >= 40:
+
+        risk_level = "moderate"
+
+    else:
+
+        risk_level = "low"
+
+    drivers = []
+
+    if vegetation_stress >= 60:
+
+        drivers.append(
+            "low vegetation response"
+        )
+
+    if field_condition_stress >= 50:
+
+        drivers.append(
+            "reduced field condition"
+        )
+
+    if spatial_stress >= 30:
+
+        drivers.append(
+            "spatial vegetation variability"
+        )
+
+    if bare_cover_stress >= 25:
+
+        drivers.append(
+            "increased bare/sparse cover"
+        )
+
+    if not drivers:
+
+        drivers.append(
+            "no dominant stress signal"
+        )
+
+    if vegetation_stress >= 60:
+
+        primary_signal = (
+            "low vegetation response"
+        )
+
+    elif field_condition_stress >= 50:
+
+        primary_signal = (
+            "reduced field condition"
+        )
+
+    elif spatial_stress >= 30:
+
+        primary_signal = (
+            "spatial vegetation variability"
+        )
+
+    else:
+
+        primary_signal = (
+            "no dominant stress signal"
+        )
+
+    if risk_level == "high":
+
+        interpretation = (
+            "Elevated crop-stress signal detected. "
+            "Field inspection and follow-up satellite "
+            "observation are recommended."
+        )
+
+    elif risk_level == "moderate":
+
+        interpretation = (
+            "Moderate crop-stress signal detected. "
+            "Continue monitoring and inspect areas showing "
+            "vegetation deterioration."
+        )
+
+    else:
+
+        interpretation = (
+            "No strong crop-stress signal detected "
+            "in the current satellite observation."
+        )
+
+    confidence = observation_quality
+
+    return {
+        "score": risk_score,
+        "level": risk_level,
+        "confidence": confidence,
+        "primary_signal": primary_signal,
+        "drivers": drivers,
+        "interpretation": interpretation,
+        "factors": {
+            "vegetation_stress":
+                vegetation_stress,
+            "spatial_stress":
+                spatial_stress,
+            "field_condition_stress":
+                field_condition_stress,
+            "bare_cover_stress":
+                bare_cover_stress,
+            "observation_quality":
+                observation_quality,
+        },
+        "temporal_context": {
+            "historical_change": None,
+            "historical_trend": "available via /ndvi-history",
+        },
+        "disclaimer": (
+            "This is a satellite-derived crop-stress "
+            "and pest-risk early-warning indicator. "
+            "It does not identify a specific pest or "
+            "disease and should be validated with "
+            "field observations."
+        ),
+    }
+
+
+# ============================================================
+# LAND COVER
+# ============================================================
+
+def classify_land_cover(
+    blue: np.ndarray,
+    green: np.ndarray,
+    red: np.ndarray,
+    nir: np.ndarray,
+    ndvi: np.ndarray,
+):
+    """
+    Random Forest land-cover classification.
+
+    To reduce CPU/memory usage, every ML_PIXEL_STRIDE-th
+    pixel is sampled before prediction.
+    """
+
+    # --------------------------------------------------------
+    # Downsample the prediction input
+    # --------------------------------------------------------
+
+    blue_sample = blue[
+        ::ML_PIXEL_STRIDE,
+        ::ML_PIXEL_STRIDE,
+    ]
+
+    green_sample = green[
+        ::ML_PIXEL_STRIDE,
+        ::ML_PIXEL_STRIDE,
+    ]
+
+    red_sample = red[
+        ::ML_PIXEL_STRIDE,
+        ::ML_PIXEL_STRIDE,
+    ]
+
+    nir_sample = nir[
+        ::ML_PIXEL_STRIDE,
+        ::ML_PIXEL_STRIDE,
+    ]
+
+    ndvi_sample = ndvi[
+        ::ML_PIXEL_STRIDE,
+        ::ML_PIXEL_STRIDE,
+    ]
+
+    blue_flat = blue_sample.reshape(-1)
+    green_flat = green_sample.reshape(-1)
+    red_flat = red_sample.reshape(-1)
+    nir_flat = nir_sample.reshape(-1)
+    ndvi_flat = ndvi_sample.reshape(-1)
+
+    del blue_sample
+    del green_sample
+    del red_sample
+    del nir_sample
+    del ndvi_sample
+
+    class_counts = {}
+
+    total_pixels = len(
+        ndvi_flat
+    )
+
+    for start in range(
+        0,
+        total_pixels,
+        ML_CHUNK_SIZE,
+    ):
+
+        end = min(
+            start + ML_CHUNK_SIZE,
+            total_pixels,
+        )
+
+        b = blue_flat[
+            start:end
+        ]
+
+        g = green_flat[
+            start:end
+        ]
+
+        r = red_flat[
+            start:end
+        ]
+
+        n = nir_flat[
+            start:end
+        ]
+
+        v = ndvi_flat[
+            start:end
+        ]
+
+        valid_mask = (
+            np.isfinite(b)
+            & np.isfinite(g)
+            & np.isfinite(r)
+            & np.isfinite(n)
+            & np.isfinite(v)
+        )
+
+        if not np.any(
+            valid_mask
+        ):
+            continue
+
+        X_chunk = np.column_stack(
+            [
+                b[valid_mask],
+                g[valid_mask],
+                r[valid_mask],
+                n[valid_mask],
+                v[valid_mask],
+            ]
+        )
+
+        predictions = clf.predict(
+            X_chunk
+        )
+
+        unique, counts = np.unique(
+            predictions,
+            return_counts=True,
+        )
+
+        for cls, count in zip(
+            unique,
+            counts,
+        ):
+
+            cls_int = int(
+                cls
+            )
+
+            class_counts[
+                cls_int
+            ] = (
+                class_counts.get(
+                    cls_int,
+                    0,
+                )
+                + int(count)
+            )
+
+        del X_chunk
+        del predictions
+
+        gc.collect()
+
+    del blue_flat
+    del green_flat
+    del red_flat
+    del nir_flat
+    del ndvi_flat
+
+    gc.collect()
+
+    total_predictions = sum(
+        class_counts.values()
+    )
+
+    land_cover = []
+
+    if total_predictions <= 0:
+
+        return land_cover
+
+    for (
+        cls_int,
+        count,
+    ) in class_counts.items():
+
+        info = WORLDCOVER_CLASSES.get(
+            cls_int
+        )
+
+        if info is None:
+            continue
+
+        percentage = (
+            count
+            / total_predictions
+            * 100
+        )
+
+        land_cover.append(
+            {
+                "name":
+                    info["name"],
+
+                "value":
+                    round(
+                        percentage,
+                        1,
+                    ),
+
+                "color":
+                    info["color"],
+            }
+        )
+
+    land_cover.sort(
+        key=lambda x: x[
+            "value"
+        ],
+        reverse=True,
+    )
+
+    return land_cover
+
+
+# ============================================================
 # HISTORICAL NDVI
 # ============================================================
 
@@ -1145,7 +1516,7 @@ def get_ndvi_history_data(
     lon: float,
 ):
     """
-    Retrieve one suitable Sentinel-2 observation per month.
+    Historical processing lives here instead of /analyze.
     """
 
     bbox = make_bbox(
@@ -1274,38 +1645,68 @@ def get_ndvi_history_data(
 
         try:
 
-            _ndvi, avg_ndvi = (
-                calculate_scene_ndvi(
-                    item,
-                    bbox,
-                )
+            red = load_band(
+                item,
+                "B04",
+                bbox,
+            )
+
+            nir = load_band(
+                item,
+                "B08",
+                bbox,
+            )
+
+            ndvi = calculate_ndvi(
+                red,
+                nir,
+            )
+
+            valid = ndvi[
+                np.isfinite(ndvi)
+            ]
+
+            if valid.size == 0:
+                continue
+
+            avg_ndvi = float(
+                np.mean(valid)
             )
 
             observations.append(
                 {
-                    "date": candidate[
-                        "date"
-                    ],
-
-                    "period": month,
-
-                    "ndvi": round(
-                        avg_ndvi,
-                        3,
-                    ),
-
-                    "cloud_cover": round(
+                    "date":
                         candidate[
-                            "cloud_cover"
+                            "date"
                         ],
-                        1,
-                    ),
 
-                    "scene_id": item.id,
+                    "period":
+                        month,
+
+                    "ndvi":
+                        round(
+                            avg_ndvi,
+                            3,
+                        ),
+
+                    "cloud_cover":
+                        round(
+                            candidate[
+                                "cloud_cover"
+                            ],
+                            1,
+                        ),
+
+                    "scene_id":
+                        item.id,
                 }
             )
 
-            del _ndvi
+            del red
+            del nir
+            del ndvi
+
+            gc.collect()
 
         except Exception as scene_error:
 
@@ -1328,13 +1729,17 @@ def get_ndvi_history_data(
         ]
     )
 
-    first_ndvi = observations[
-        0
-    ]["ndvi"]
+    first_ndvi = (
+        observations[
+            0
+        ]["ndvi"]
+    )
 
-    latest_ndvi = observations[
-        -1
-    ]["ndvi"]
+    latest_ndvi = (
+        observations[
+            -1
+        ]["ndvi"]
+    )
 
     change = (
         latest_ndvi
@@ -1351,416 +1756,36 @@ def get_ndvi_history_data(
         trend = "stable"
 
     return {
-        "observations": observations,
+        "observations":
+            observations,
 
         "summary": {
-            "first_ndvi": round(
-                first_ndvi,
-                3,
-            ),
+            "first_ndvi":
+                round(
+                    first_ndvi,
+                    3,
+                ),
 
-            "latest_ndvi": round(
-                latest_ndvi,
-                3,
-            ),
+            "latest_ndvi":
+                round(
+                    latest_ndvi,
+                    3,
+                ),
 
-            "change": round(
-                change,
-                3,
-            ),
+            "change":
+                round(
+                    change,
+                    3,
+                ),
 
-            "trend": trend,
+            "trend":
+                trend,
 
             "observation_count":
-                len(observations),
-        },
-    }
-
-
-# ============================================================
-# CROP STRESS / PEST-RISK EARLY WARNING
-# ============================================================
-
-def calculate_stress_risk(
-    avg_ndvi: float,
-    soil_condition: dict,
-    cloud_cover: float,
-    historical_change,
-    historical_trend: str,
-):
-    """
-    Satellite-derived crop-stress / pest-risk
-    early-warning indicator.
-
-    It does NOT identify a specific pest or disease.
-    """
-
-    # --------------------------------------------------------
-    # VEGETATION STRESS
-    # --------------------------------------------------------
-
-    vegetation_stress = round(
-        max(
-            0,
-            min(
-                100,
-                (
-                    (
-                        0.7
-                        - avg_ndvi
-                    )
-                    / 0.7
-                )
-                * 100,
-            ),
-        )
-    )
-
-    # --------------------------------------------------------
-    # TEMPORAL STRESS
-    # --------------------------------------------------------
-
-    if (
-        historical_change is not None
-        and historical_change < 0
-    ):
-
-        temporal_stress = round(
-            max(
-                0,
-                min(
-                    100,
-                    abs(
-                        historical_change
-                    )
-                    * 400,
+                len(
+                    observations
                 ),
-            )
-        )
-
-    else:
-
-        temporal_stress = 0
-
-    if historical_trend == "increasing":
-
-        temporal_stress = round(
-            temporal_stress
-            * 0.25
-        )
-
-    # --------------------------------------------------------
-    # SPATIAL STRESS
-    # --------------------------------------------------------
-
-    spatial_consistency = int(
-        soil_condition.get(
-            "spatial_consistency",
-            50,
-        )
-    )
-
-    spatial_stress = round(
-        max(
-            0,
-            min(
-                100,
-                100
-                - spatial_consistency,
-            ),
-        )
-    )
-
-    # --------------------------------------------------------
-    # FIELD CONDITION STRESS
-    # --------------------------------------------------------
-
-    field_condition_score = int(
-        soil_condition.get(
-            "score",
-            50,
-        )
-    )
-
-    field_condition_stress = round(
-        max(
-            0,
-            min(
-                100,
-                100
-                - field_condition_score,
-            ),
-        )
-    )
-
-    # --------------------------------------------------------
-    # BARE COVER
-    # --------------------------------------------------------
-
-    bare_sparse_cover = float(
-        soil_condition.get(
-            "bare_sparse_cover",
-            0,
-        )
-    )
-
-    bare_cover_stress = round(
-        max(
-            0,
-            min(
-                100,
-                bare_sparse_cover
-                * 2,
-            ),
-        )
-    )
-
-    # --------------------------------------------------------
-    # OBSERVATION QUALITY
-    # --------------------------------------------------------
-
-    cloud_penalty = round(
-        max(
-            0,
-            min(
-                100,
-                cloud_cover,
-            ),
-        )
-    )
-
-    observation_quality = round(
-        max(
-            0,
-            100
-            - cloud_penalty,
-        )
-    )
-
-    # --------------------------------------------------------
-    # RISK SCORE
-    # --------------------------------------------------------
-
-    risk_score = round(
-        (
-            vegetation_stress * 0.35
-            + temporal_stress * 0.25
-            + field_condition_stress * 0.20
-            + spatial_stress * 0.10
-            + bare_cover_stress * 0.10
-        )
-    )
-
-    risk_score = max(
-        0,
-        min(
-            100,
-            risk_score,
-        ),
-    )
-
-    # --------------------------------------------------------
-    # RISK LEVEL
-    # --------------------------------------------------------
-
-    if risk_score >= 70:
-
-        risk_level = "high"
-
-    elif risk_score >= 40:
-
-        risk_level = "moderate"
-
-    else:
-
-        risk_level = "low"
-
-    # --------------------------------------------------------
-    # CONFIDENCE
-    # --------------------------------------------------------
-
-    if historical_change is not None:
-
-        confidence = round(
-            min(
-                100,
-                observation_quality
-                * 0.85
-                + 15,
-            )
-        )
-
-    else:
-
-        confidence = observation_quality
-
-    # --------------------------------------------------------
-    # DRIVERS
-    # --------------------------------------------------------
-
-    drivers = []
-
-    if vegetation_stress >= 60:
-
-        drivers.append(
-            "low vegetation response"
-        )
-
-    if temporal_stress >= 40:
-
-        if historical_trend == "decreasing":
-
-            drivers.append(
-                "declining temporal NDVI trend"
-            )
-
-        else:
-
-            drivers.append(
-                "temporal vegetation change"
-            )
-
-    if field_condition_stress >= 50:
-
-        drivers.append(
-            "reduced field condition"
-        )
-
-    if spatial_stress >= 30:
-
-        drivers.append(
-            "spatial vegetation variability"
-        )
-
-    if bare_cover_stress >= 25:
-
-        drivers.append(
-            "increased bare/sparse cover"
-        )
-
-    if not drivers:
-
-        drivers.append(
-            "no dominant stress signal"
-        )
-
-    # --------------------------------------------------------
-    # PRIMARY SIGNAL
-    # --------------------------------------------------------
-
-    if (
-        temporal_stress
-        >= vegetation_stress
-    ):
-
-        primary_signal = (
-            "temporal vegetation change"
-        )
-
-    elif vegetation_stress >= 60:
-
-        primary_signal = (
-            "low vegetation response"
-        )
-
-    elif field_condition_stress >= 50:
-
-        primary_signal = (
-            "reduced field condition"
-        )
-
-    elif spatial_stress >= 30:
-
-        primary_signal = (
-            "spatial vegetation variability"
-        )
-
-    else:
-
-        primary_signal = (
-            "no dominant stress signal"
-        )
-
-    # --------------------------------------------------------
-    # INTERPRETATION
-    # --------------------------------------------------------
-
-    if risk_level == "high":
-
-        interpretation = (
-            "Elevated crop-stress signal detected. "
-            "Field inspection and follow-up satellite "
-            "observation are recommended."
-        )
-
-    elif risk_level == "moderate":
-
-        interpretation = (
-            "Moderate crop-stress signal detected. "
-            "Continue temporal monitoring and inspect "
-            "areas showing vegetation deterioration."
-        )
-
-    else:
-
-        interpretation = (
-            "No strong crop-stress signal detected "
-            "in the current satellite observations."
-        )
-
-    return {
-        "score": risk_score,
-
-        "level": risk_level,
-
-        "confidence": confidence,
-
-        "primary_signal":
-            primary_signal,
-
-        "drivers":
-            drivers,
-
-        "interpretation":
-            interpretation,
-
-        "factors": {
-
-            "vegetation_stress":
-                vegetation_stress,
-
-            "temporal_stress":
-                temporal_stress,
-
-            "spatial_stress":
-                spatial_stress,
-
-            "field_condition_stress":
-                field_condition_stress,
-
-            "bare_cover_stress":
-                bare_cover_stress,
-
-            "observation_quality":
-                observation_quality,
         },
-
-        "temporal_context": {
-
-            "historical_change":
-                historical_change,
-
-            "historical_trend":
-                historical_trend,
-        },
-
-        "disclaimer": (
-            "This is a satellite-derived crop-stress "
-            "and pest-risk early-warning indicator. "
-            "It does not identify a specific pest or "
-            "disease and should be validated with "
-            "field observations."
-        ),
     }
 
 
@@ -1778,39 +1803,23 @@ def analyze(
         req.lon,
     )
 
-    print(
-        "\n=========================================="
-    )
-
-    print(
-        "NEW ANALYSIS REQUEST"
-    )
-
-    print(
-        "Latitude:",
-        req.lat,
-    )
-
-    print(
-        "Longitude:",
-        req.lon,
-    )
-
-    print(
-        "=========================================="
-    )
+    print("\n==========================================")
+    print("NEW FAST ANALYSIS REQUEST")
+    print("Latitude:", req.lat)
+    print("Longitude:", req.lon)
+    print("==========================================")
 
     bbox = make_bbox(
         req.lat,
         req.lon,
     )
 
-    # --------------------------------------------------------
-    # SEARCH LATEST SENTINEL-2 SCENE
-    # --------------------------------------------------------
+    # ========================================================
+    # FIND LATEST SCENE
+    # ========================================================
 
     print(
-        "Searching Sentinel-2 imagery..."
+        "Searching latest Sentinel-2 scene..."
     )
 
     search = catalog.search(
@@ -1870,15 +1879,10 @@ def analyze(
     )
 
     if cloud_cover is None:
-
         cloud_cover = 0
 
     print(
-        "Scene selected:"
-    )
-
-    print(
-        "Scene:",
+        "Scene selected:",
         item.id,
     )
 
@@ -1895,7 +1899,7 @@ def analyze(
     try:
 
         # ====================================================
-        # LOAD RED + NIR FIRST
+        # LOAD RED + NIR
         # ====================================================
 
         red = load_band(
@@ -1909,10 +1913,6 @@ def analyze(
             "B08",
             bbox,
         )
-
-        # ====================================================
-        # NDVI
-        # ====================================================
 
         print(
             "Calculating NDVI..."
@@ -1954,15 +1954,6 @@ def analyze(
         )
 
         # ====================================================
-        # SOIL / FIELD CONDITION
-        # ====================================================
-
-        # Land cover is calculated later, so temporarily
-        # calculate condition using an empty list.
-        #
-        # We recalculate after classification below.
-
-        # ====================================================
         # SPATIAL MAP
         # ====================================================
 
@@ -1972,8 +1963,8 @@ def analyze(
 
         spatial_analysis = (
             calculate_spatial_analysis(
-                ndvi=ndvi,
-                bbox=bbox,
+                ndvi,
+                bbox,
             )
         )
 
@@ -1985,7 +1976,7 @@ def analyze(
         )
 
         # ====================================================
-        # LOAD BLUE + GREEN FOR RGB + ML
+        # LOAD RGB
         # ====================================================
 
         blue = load_band(
@@ -2001,196 +1992,24 @@ def analyze(
         )
 
         # ====================================================
-        # RANDOM FOREST LAND COVER
-        # ====================================================
+        # LAND COVER
+        # ========================================================
 
         print(
-            "Running Random Forest..."
+            "Running sampled Random Forest..."
         )
 
-        blue_flat = blue.reshape(-1)
-        green_flat = green.reshape(-1)
-        red_flat = red.reshape(-1)
-        nir_flat = nir.reshape(-1)
-        ndvi_flat = ndvi.reshape(-1)
-
-        total_pixels = len(
-            ndvi_flat
+        land_cover = classify_land_cover(
+            blue,
+            green,
+            red,
+            nir,
+            ndvi,
         )
 
-        class_counts = {}
-
-        # ----------------------------------------------------
-        # Predict in chunks
-        # ----------------------------------------------------
-
-        for start in range(
-            0,
-            total_pixels,
-            ML_CHUNK_SIZE,
-        ):
-
-            end = min(
-                start + ML_CHUNK_SIZE,
-                total_pixels,
-            )
-
-            blue_chunk = blue_flat[
-                start:end
-            ]
-
-            green_chunk = green_flat[
-                start:end
-            ]
-
-            red_chunk = red_flat[
-                start:end
-            ]
-
-            nir_chunk = nir_flat[
-                start:end
-            ]
-
-            ndvi_chunk = ndvi_flat[
-                start:end
-            ]
-
-            valid_mask = (
-                np.isfinite(
-                    blue_chunk
-                )
-                & np.isfinite(
-                    green_chunk
-                )
-                & np.isfinite(
-                    red_chunk
-                )
-                & np.isfinite(
-                    nir_chunk
-                )
-                & np.isfinite(
-                    ndvi_chunk
-                )
-            )
-
-            if not np.any(
-                valid_mask
-            ):
-                continue
-
-            X_chunk = np.column_stack(
-                [
-                    blue_chunk[
-                        valid_mask
-                    ],
-
-                    green_chunk[
-                        valid_mask
-                    ],
-
-                    red_chunk[
-                        valid_mask
-                    ],
-
-                    nir_chunk[
-                        valid_mask
-                    ],
-
-                    ndvi_chunk[
-                        valid_mask
-                    ],
-                ]
-            )
-
-            predictions = clf.predict(
-                X_chunk
-            )
-
-            unique, counts = np.unique(
-                predictions,
-                return_counts=True,
-            )
-
-            for cls, count in zip(
-                unique,
-                counts,
-            ):
-
-                cls_int = int(
-                    cls
-                )
-
-                class_counts[
-                    cls_int
-                ] = (
-                    class_counts.get(
-                        cls_int,
-                        0,
-                    )
-                    + int(count)
-                )
-
-            del X_chunk
-            del predictions
-
-            gc.collect()
-
-        # ----------------------------------------------------
-        # Land-cover percentages
-        # ----------------------------------------------------
-
-        total_predictions = sum(
-            class_counts.values()
-        )
-
-        land_cover = []
-
-        if total_predictions > 0:
-
-            for (
-                cls_int,
-                count,
-            ) in class_counts.items():
-
-                if (
-                    cls_int
-                    not in WORLDCOVER_CLASSES
-                ):
-                    continue
-
-                info = (
-                    WORLDCOVER_CLASSES[
-                        cls_int
-                    ]
-                )
-
-                percentage = (
-                    float(count)
-                    / total_predictions
-                    * 100
-                )
-
-                land_cover.append(
-                    {
-                        "name":
-                            info["name"],
-
-                        "value":
-                            round(
-                                percentage,
-                                1,
-                            ),
-
-                        "color":
-                            info["color"],
-                    }
-                )
-
-        land_cover.sort(
-            key=lambda x: x[
-                "value"
-            ],
-            reverse=True,
+        print(
+            "Land cover:",
+            land_cover,
         )
 
         # ====================================================
@@ -2215,7 +2034,30 @@ def analyze(
         )
 
         # ====================================================
-        # CREATE IMAGE
+        # FAST STRESS RISK
+        # ====================================================
+
+        print(
+            "Calculating current stress risk..."
+        )
+
+        stress_risk = (
+            calculate_fast_stress_risk(
+                avg_ndvi=avg_ndvi,
+                soil_condition=soil_condition,
+                cloud_cover=float(
+                    cloud_cover
+                ),
+            )
+        )
+
+        print(
+            "Stress risk:",
+            stress_risk,
+        )
+
+        # ====================================================
+        # TRUE COLOR IMAGE
         # ====================================================
 
         print(
@@ -2231,14 +2073,8 @@ def analyze(
         )
 
         # ====================================================
-        # RELEASE LARGE CURRENT ARRAYS
+        # TEMPORARY MEMORY CLEANUP
         # ====================================================
-
-        del blue_flat
-        del green_flat
-        del red_flat
-        del nir_flat
-        del ndvi_flat
 
         del blue
         del green
@@ -2249,122 +2085,22 @@ def analyze(
 
         gc.collect()
 
-        print(
-            "Current-scene memory released."
-        )
-
-        # ====================================================
-        # HISTORICAL NDVI
-        # ====================================================
-
-        print(
-            "Loading historical NDVI for stress analysis..."
-        )
-
-        history_data = None
-
-        try:
-
-            history_data = (
-                get_ndvi_history_data(
-                    req.lat,
-                    req.lon,
-                )
-            )
-
-        except Exception as history_error:
-
-            print(
-                "Historical NDVI unavailable:",
-                str(
-                    history_error
-                ),
-            )
-
-        if history_data:
-
-            historical_change = (
-                history_data[
-                    "summary"
-                ]["change"]
-            )
-
-            historical_trend = (
-                history_data[
-                    "summary"
-                ]["trend"]
-            )
-
-        else:
-
-            historical_change = None
-
-            historical_trend = (
-                "unavailable"
-            )
-
-        print(
-            "Historical change:",
-            historical_change,
-        )
-
-        print(
-            "Historical trend:",
-            historical_trend,
-        )
-
-        # ====================================================
-        # STRESS / PEST RISK
-        # ====================================================
-
-        print(
-            "Calculating crop stress / pest-risk indicator..."
-        )
-
-        stress_risk = (
-            calculate_stress_risk(
-                avg_ndvi=avg_ndvi,
-                soil_condition=soil_condition,
-                cloud_cover=float(
-                    cloud_cover
-                ),
-                historical_change=historical_change,
-                historical_trend=historical_trend,
-            )
-        )
-
-        print(
-            "Stress risk:",
-            stress_risk,
-        )
-
         # ====================================================
         # RESPONSE
         # ====================================================
 
         response = {
-
             "coordinates": {
-
-                "lat":
-                    req.lat,
-
-                "lon":
-                    req.lon,
+                "lat": req.lat,
+                "lon": req.lon,
             },
 
             "scene": {
-
-                "id":
-                    item.id,
-
-                "date":
-                    scene_datetime,
-
-                "cloud_cover":
-                    float(
-                        cloud_cover
-                    ),
+                "id": item.id,
+                "date": scene_datetime,
+                "cloud_cover": float(
+                    cloud_cover
+                ),
             },
 
             "satellite_image":
@@ -2391,38 +2127,23 @@ def analyze(
             "spatial_analysis":
                 spatial_analysis,
 
-            "temporal_summary": (
+            "temporal_summary": {
+                "first_ndvi": None,
+                "latest_ndvi": None,
+                "change": None,
+                "trend": "available via /ndvi-history",
+                "observation_count": 0,
+            },
 
-                history_data[
-                    "summary"
-                ]
+            "analysis_mode":
+                "fast-current-scene",
 
-                if history_data
-
-                else {
-
-                    "first_ndvi":
-                        None,
-
-                    "latest_ndvi":
-                        None,
-
-                    "change":
-                        None,
-
-                    "trend":
-                        "unavailable",
-
-                    "observation_count":
-                        0,
-                }
-            ),
+            "history_endpoint":
+                "/ndvi-history",
         }
 
-        gc.collect()
-
         print(
-            "Analysis completed successfully."
+            "Fast analysis completed successfully."
         )
 
         return response
@@ -2460,27 +2181,11 @@ def ndvi_history(
         lon,
     )
 
-    print(
-        "\n=========================================="
-    )
-
-    print(
-        "NDVI HISTORY REQUEST"
-    )
-
-    print(
-        "Latitude:",
-        lat,
-    )
-
-    print(
-        "Longitude:",
-        lon,
-    )
-
-    print(
-        "=========================================="
-    )
+    print("\n==========================================")
+    print("NDVI HISTORY REQUEST")
+    print("Latitude:", lat)
+    print("Longitude:", lon)
+    print("==========================================")
 
     try:
 
@@ -2508,18 +2213,12 @@ def ndvi_history(
         )
 
         response = {
-
             "coordinates": {
-
-                "lat":
-                    lat,
-
-                "lon":
-                    lon,
+                "lat": lat,
+                "lon": lon,
             },
 
             "period": {
-
                 "start":
                     observations[
                         0
@@ -2544,9 +2243,7 @@ def ndvi_history(
 
         print(
             "NDVI history completed:",
-            len(
-                observations
-            ),
+            len(observations),
             "observations",
         )
 
@@ -2582,7 +2279,6 @@ def ndvi_history(
 def root():
 
     return {
-
         "service":
             "Team Kanyarasi Satellite Intelligence API",
 
@@ -2590,13 +2286,22 @@ def root():
             "running",
 
         "version":
-            "1.7.0",
+            "1.8.0",
 
         "memory_optimized":
             True,
 
+        "fast_analysis":
+            True,
+
+        "historical_processing_in_analyze":
+            False,
+
         "spatial_grid":
             f"{SPATIAL_GRID_SIZE}x{SPATIAL_GRID_SIZE}",
+
+        "ml_pixel_stride":
+            ML_PIXEL_STRIDE,
 
         "endpoints": [
             "/health",
